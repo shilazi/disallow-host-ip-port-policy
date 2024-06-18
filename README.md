@@ -1,40 +1,91 @@
-[![Stable](https://img.shields.io/badge/status-stable-brightgreen?style=for-the-badge)](https://github.com/kubewarden/community/blob/main/REPOSITORIES.md#stable)
+# disallow-host-ip-port-policy
 
-Please, note well: this file and the scaffold were generated from [a
-template](https://github.com/kubewarden/rust-policy-template). Make
-this project yours!
+Disallow `hostIP` or/and `hostPort` was set
 
-You can use `cargo generate -g https://github.com/kubewarden/rust-policy-template.git`
-to create your Policy from this template.
+## Build
 
-# Kubewarden policy disallow-host-ip-port-policy
+```bash
+make
+```
 
-## Description
+## Usage
 
-This policy will reject pods that have a name `invalid-pod-name`. If
-the pod to be validated has a different name, or if a different type
-of resource is evaluated, it will be accepted.
+1. Upload `disallow-host-ip-port-policy-v1.0.0.wasm` to static server
+2. Generate `ClusterAdmissionPolicy` manifest
+    ```yaml
+    apiVersion: policies.kubewarden.io/v1alpha2
+    kind: ClusterAdmissionPolicy
+    metadata:
+      name: disallow-host-ip-port-policy
+    spec:
+      module: https://your.server/kubewarden/policies/disallow-host-ip-port-policy-v1.0.0.wasm
+      rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations: ["CREATE"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["replicationcontrollers"]
+        operations: ["CREATE", "UPDATE"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+        operations: ["CREATE", "UPDATE"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1", "v1beta1"]
+        resources: ["jobs", "cronjobs"]
+        operations: ["CREATE", "UPDATE"]
+      mutating: false
+      settings:
+        # exempt with service account by username
+        exempt_users:
+        - kubernetes-admin
+        # exempt with Namespace
+        exempt_namespaces:
+        - kube-system
+    ```
+3. Apply with kubectl
+   ```bash 
+   kubectl apply -f disallow-host-ip-port-policy.yml
+   ```
 
-## Settings
+## Validation
 
-This policy has no configurable settings. This would be a good place
-to document if yours does, and what behaviors can be configured by
-tweaking them.
+Example pod manifest:
 
-## License
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  containers:
+  - image: nginx
+    name: nginx
+    ports:
+    - name: t80
+      containerPort: 80
+      hostIP: 127.0.0.1
+      hostPort: 80
+EOF
+```
+
+With exempt:
 
 ```
-Copyright (C) 2021 shilazi <nilprobe@gmail.com>
+$ kubectl get po
+NAME   READY   STATUS             RESTARTS   AGE
+nginx  1/1     Running            0          15s
+```
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+```
+accepting Pod with exemption data={"column":5,"file":"src/lib.rs","line":58,"policy":"disallow-host-ip-port-policy"}
+```
 
-   http://www.apache.org/licenses/LICENSE-2.0
+Without exempt:
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+```
+Error from server: error when creating "pod.yml": admission webhook "disallow-host-ip-port-policy.kubewarden.admission" denied the request: Container run with hostIP or/and hostPort is not allowed
 ```

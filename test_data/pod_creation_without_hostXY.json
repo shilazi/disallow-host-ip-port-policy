@@ -69,7 +69,6 @@
               },
               "f:dnsPolicy": {},
               "f:enableServiceLinks": {},
-              "f:hostPID": {},
               "f:restartPolicy": {},
               "f:schedulerName": {},
               "f:securityContext": {},
@@ -92,21 +91,19 @@
         {
           "name": "nginx",
           "image": "nginx:1.26.1",
+          "ports": [
+            {
+              "containerPort": 80,
+              "name": "t80",
+              "protocol;": "TCP"
+            }
+          ],
           "resources": {},
           "volumeMounts": [
             {
               "name": "default-token-5kcs4",
               "readOnly": true,
               "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"
-            }
-          ],
-          "ports": [
-            {
-              "containerPort": 80,
-              "hostIP": "127.0.0.1",
-              "hostPort": 80,
-              "name": "t80",
-              "protocol;": "TCP"
             }
           ],
           "terminationMessagePath": "/dev/termination-log",

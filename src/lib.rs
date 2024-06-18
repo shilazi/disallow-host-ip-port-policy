@@ -1,8 +1,11 @@
+use anyhow::{anyhow, Result};
 use lazy_static::lazy_static;
 
 use guest::prelude::*;
 use kubewarden_policy_sdk::wapc_guest as guest;
 
+use k8s_openapi::api::batch::v1::CronJob as v1_cronJob;
+use k8s_openapi::api::batch::v1beta1::CronJob as v1beta1_cronJob;
 use k8s_openapi::api::core::v1 as apicore;
 use k8s_openapi::Resource;
 
@@ -17,7 +20,7 @@ use slog::{info, o, warn, Logger};
 lazy_static! {
     static ref LOG_DRAIN: Logger = Logger::root(
         logging::KubewardenDrain::new(),
-        o!("policy" => "sample-policy")
+        o!("policy" => settings::POLICY_NAME)
     );
 }
 
@@ -29,76 +32,130 @@ pub extern "C" fn wapc_init() {
 }
 
 fn validate(payload: &[u8]) -> CallResult {
-    let validation_request: ValidationRequest<Settings> = ValidationRequest::new(payload)?;
+    let mut validation_request: ValidationRequest<Settings> = ValidationRequest::new(payload)?;
 
     info!(LOG_DRAIN, "starting validation");
-    if validation_request.request.kind.kind != apicore::Pod::KIND {
-        warn!(LOG_DRAIN, "Policy validates Pods only. Accepting resource"; "kind" => &validation_request.request.kind.kind);
+    if validation_request.request.dry_run {
+        info!(LOG_DRAIN, "dry run mode, accepting resource");
         return kubewarden::accept_request();
     }
-    // TODO: you can unmarshal any Kubernetes API type you are interested in
-    match serde_json::from_value::<apicore::Pod>(validation_request.request.object) {
-        Ok(pod) => {
-            // TODO: your logic goes here
-            if pod.metadata.name == Some("invalid-pod-name".to_string()) {
-                let pod_name = pod.metadata.name.unwrap();
-                info!(
-                    LOG_DRAIN,
-                    "rejecting pod";
-                    "pod_name" => &pod_name
-                );
-                kubewarden::reject_request(
-                    Some(format!("pod name {} is not accepted", &pod_name)),
-                    None,
-                    None,
-                    None,
-                )
-            } else {
-                info!(LOG_DRAIN, "accepting resource");
-                kubewarden::accept_request()
-            }
+
+    // service account username
+    let username = &validation_request.request.user_info.username;
+    // obj name
+    let obj_name = &validation_request.request.name;
+    // namespace
+    let namespace = &validation_request.request.namespace;
+    // operation
+    let operation = &validation_request.request.operation;
+    // kind
+    let kind = &validation_request.request.kind.kind;
+    // version
+    let version = &validation_request.request.kind.version;
+
+    info!(LOG_DRAIN,  "{} {}", operation.to_lowercase(), kind, ; "name" => obj_name, "namespace" => namespace);
+    if validation_request.settings.exempt(username, namespace) {
+        warn!(LOG_DRAIN, "accepting {} with exemption", kind);
+        return kubewarden::accept_request();
+    }
+
+    // when kind was CronJob, convert batch/v1beta1 to batch/v1
+    // adapt for validation_request.extract_pod_spec_from_object method
+    if kind == v1beta1_cronJob::KIND && version == v1beta1_cronJob::VERSION {
+        let v1beta1_object = &serde_json::to_string(&validation_request.request.object.clone())
+            .unwrap()
+            .replace(v1beta1_cronJob::VERSION, v1_cronJob::VERSION);
+        validation_request.request.object = serde_json::from_str(v1beta1_object).unwrap();
+    }
+
+    match validation_request.extract_pod_spec_from_object() {
+        Ok(pod_spec) => {
+            if let Some(pod_spec) = pod_spec {
+                return match validate_pod(&pod_spec) {
+                    Ok(_) => {
+                        info!(
+                            LOG_DRAIN,
+                            "accepting {} without ports[*].host{{IP, Port}}", kind
+                        );
+                        kubewarden::accept_request()
+                    }
+                    Err(err) => {
+                        warn!(
+                            LOG_DRAIN,
+                            "reject {} run with hostIP or/and hostPort was set", kind
+                        );
+                        kubewarden::reject_request(Some(err.to_string()), None, None, None)
+                    }
+                };
+            };
+            info!(LOG_DRAIN, "accepting {} with invalid pod spec", kind);
+            kubewarden::accept_request()
         }
         Err(_) => {
-            // TODO: handle as you wish
-            // We were forwarded a request we cannot unmarshal or
-            // understand, just accept it
             warn!(LOG_DRAIN, "cannot unmarshal resource: this policy does not know how to evaluate this resource; accept it");
             kubewarden::accept_request()
         }
     }
 }
 
+fn validate_pod(pod_spec: &apicore::PodSpec) -> Result<bool> {
+    for container in &pod_spec.containers {
+        let port_valid = validate_port(&container.ports);
+        if !port_valid {
+            return Err(anyhow!(
+                "Container run with hostIP or/and hostPort is not allowed"
+            ));
+        }
+    }
+    if let Some(init_containers) = &pod_spec.init_containers {
+        for container in init_containers {
+            let port_valid = validate_port(&container.ports);
+            if !port_valid {
+                return Err(anyhow!(
+                    "Init container run with hostIP or/and hostPort is not allowed"
+                ));
+            }
+        }
+    }
+    if let Some(ephemeral_containers) = &pod_spec.ephemeral_containers {
+        for container in ephemeral_containers {
+            let port_valid = validate_port(&container.ports);
+            if !port_valid {
+                return Err(anyhow!(
+                    "Ephemeral container run with hostIP or/and hostPort is not allowed"
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn validate_port(container_ports: &Option<Vec<apicore::ContainerPort>>) -> bool {
+    if let Some(ports) = container_ports {
+        for port in ports {
+            if port.host_ip.is_some() || port.host_port.is_some() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     use kubewarden_policy_sdk::test::Testcase;
 
     #[test]
-    fn accept_pod_with_valid_name() -> Result<(), ()> {
+    fn reject_obj_with_host_ip_or_and_port() -> Result<(), ()> {
         let request_file = "test_data/pod_creation.json";
+        // let request_file = "test_data/deployment_creation.json";
+        // let request_file = "test_data/replicaset_creation.json";
+        // let request_file = "test_data/cronjob_v1_creation.json";
         let tc = Testcase {
-            name: String::from("Valid name"),
-            fixture_file: String::from(request_file),
-            expected_validation_result: true,
-            settings: Settings::default(),
-        };
-
-        let res = tc.eval(validate).unwrap();
-        assert!(
-            res.mutated_object.is_none(),
-            "Something mutated with test case: {}",
-            tc.name,
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn reject_pod_with_invalid_name() -> Result<(), ()> {
-        let request_file = "test_data/pod_creation_invalid_name.json";
-        let tc = Testcase {
-            name: String::from("Bad name"),
+            name: String::from("Reject pod"),
             fixture_file: String::from(request_file),
             expected_validation_result: false,
             settings: Settings::default(),
@@ -115,13 +172,64 @@ mod tests {
     }
 
     #[test]
-    fn accept_request_with_non_pod_resource() -> Result<(), ()> {
-        let request_file = "test_data/ingress_creation.json";
+    fn reject_batchv1beta1_cronjob_with_host_ip_or_and_port() -> Result<(), ()> {
+        let request_file = "test_data/cronjob_creation.json";
         let tc = Testcase {
-            name: String::from("Ingress creation"),
+            name: String::from("Reject batch/v1beta1 cronjob"),
+            fixture_file: String::from(request_file),
+            expected_validation_result: false,
+            settings: Settings::default(),
+        };
+
+        let res = tc.eval(validate).unwrap();
+        assert!(
+            res.mutated_object.is_none(),
+            "Something mutated with test case: {}",
+            tc.name,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn accept_pod_without_host_ip_or_and_port_or_ports() -> Result<(), ()> {
+        let request_file = "test_data/pod_creation_without_hostXY.json";
+        // let request_file = "test_data/pod_creation_without_ports.json";
+        let tc = Testcase {
+            name: String::from("Accept pod"),
             fixture_file: String::from(request_file),
             expected_validation_result: true,
             settings: Settings::default(),
+        };
+
+        let res = tc.eval(validate).unwrap();
+        assert!(
+            res.mutated_object.is_none(),
+            "Something mutated with test case: {}",
+            tc.name,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn accept_pod_with_host_ip_or_and_port_but_exempt() -> Result<(), ()> {
+        let request_file = "test_data/pod_creation.json";
+        // let request_file = "test_data/deployment_creation.json";
+        // let request_file = "test_data/replicaset_creation.json";
+        // let request_file = "test_data/cronjob_v1_creation.json";
+
+        let exempt_usernames = HashSet::from(["kubernetes-admin".to_string()]);
+        let exempt_namespaces = HashSet::from(["default".to_string()]);
+
+        let tc = Testcase {
+            name: String::from("Accept pod with exempt"),
+            fixture_file: String::from(request_file),
+            expected_validation_result: true,
+            settings: Settings {
+                exempt_usernames: Some(exempt_usernames),
+                exempt_namespaces: Some(exempt_namespaces),
+            },
         };
 
         let res = tc.eval(validate).unwrap();

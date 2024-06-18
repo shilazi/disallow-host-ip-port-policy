@@ -100,15 +100,6 @@
               "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"
             }
           ],
-          "ports": [
-            {
-              "containerPort": 80,
-              "hostIP": "127.0.0.1",
-              "hostPort": 80,
-              "name": "t80",
-              "protocol;": "TCP"
-            }
-          ],
           "terminationMessagePath": "/dev/termination-log",
           "terminationMessagePolicy": "File",
           "imagePullPolicy": "IfNotPresent"
